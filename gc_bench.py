@@ -21,7 +21,7 @@ Runs are interleaved (rep -> workload -> shuffled configs) so machine drift spre
 ratios are computed against the baseline config of the same batch/rep, which makes results from different
 machines (e.g. GitHub runners) comparable. Re-running with the same --work and --batch resumes.
 """
-import argparse, fnmatch, hashlib, json, math, os, platform, random, re, shutil, socket, stat, statistics as st
+import argparse, fnmatch, gzip, hashlib, json, math, os, platform, random, re, shutil, socket, stat, statistics as st
 import subprocess, sys, tarfile, time, urllib.request, zipfile
 from pathlib import Path
 
@@ -470,7 +470,9 @@ def run_one(cfg, wl, rep, target, heaps, gama_root, javas, work, batch, timeout)
 	(rundir / "artifacts.xml").unlink(missing_ok=True)
 	for f in ("gc.log", "stdout.log"):  # keep the logs, compressed
 		if (rundir / f).exists():
-			subprocess.run(["gzip", "-f", str(rundir / f)])
+			with open(rundir / f, "rb") as src, gzip.open(rundir / (f + ".gz"), "wb") as dst:
+				shutil.copyfileobj(src, dst, 1 << 20)
+			(rundir / f).unlink()
 	return r
 
 
