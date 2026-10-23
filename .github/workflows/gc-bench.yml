@@ -54,7 +54,7 @@ jobs:
           import json, os, sys
           sys.path.insert(0, ".")
           import gc_bench as g
-          wls = g.select(list(g.WORKLOADS), os.environ["WORKLOADS"])
+          wls = g.select(g.workload_names(), os.environ["WORKLOADS"])
           inc = [{"workload": w, "rep": r} for r in range(int(os.environ["REPS"])) for w in wls]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": inc}) + "\n")

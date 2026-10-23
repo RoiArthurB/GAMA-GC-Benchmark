@@ -11,8 +11,9 @@ Needs only Linux x86_64 and Python >= 3.9 (standard library only).
   python3 gc_bench.py list               # configs and workloads
 
 What it measures, per run:
-  * sim_s       wall time of the simulated cycles only (startup and compilation excluded),
-                from a probe injected in each model that writes a timestamp every cycle
+  * sim_s       wall time of the simulated cycles only (startup and compilation excluded), from a probe
+                injected in each model that writes a timestamp every cycle; for -batch workloads (many
+                simulations in one JVM, see SCENARIOS) it is the makespan of all of them
   * cyc_p50/p99/max  cycle-time distribution (the simulation equivalent of frame times)
   * stw_ms      stop-the-world time from -Xlog:safepoint (HotSpot) or verbose GC <exclusive> (OpenJ9)
   * pacing_ms / alloc_stall_ms  Shenandoah pacer delays / ZGC allocation stalls (stops that are not safepoints)
@@ -52,13 +53,29 @@ WORKLOADS = {
 	"flu": dict(src="Tutorials/Luneray flu", model="models/model6.gaml", exp="main", cycles=150, subs=[
 		("int nb_people <- 2147", "int nb_people <- 5000")]),
 }
-NOMINAL_RUN_S = 75  # per run including JVM/GAMA startup, used only for the time estimate
+# Scenarios: every model runs as one simulation per JVM (the interactive / GUI-like case) and as a parallel batch:
+# `parallel` simulations at once (default: every logical core) and `waves` simulations in a row on each worker, so
+# later simulations start after a model reload while the previous ones are garbage. Batch simulations run
+# `cycles` x `cycle_factor` cycles each.
+SCENARIOS = {"": dict(batch=False), "-batch": dict(batch=True, cycle_factor=0.4)}
+NOMINAL_RUN_S = {False: 75, True: 180}  # per run including JVM/GAMA startup, used only for the time estimate
 
-# Appends one line per cycle to a file: 'write' is silent when the shipped Gama.ini disables logging, and a file
-# survives a run that dies (zero-GC references). Runs are sequential, so one file per workload is enough.
-PROBE = ("\n\tfloat __bench_t0 <- gama.machine_time;\n"
-		 "\treflex __bench_probe { save (\"BENCH_T \" + cycle + \" \" + int(gama.machine_time - __bench_t0)) "
-		 "to: \"{path}\" format: \"text\" rewrite: false; }\n")
+# Appends one line per cycle to a file per simulation (named after its seed): 'write' is silent when the shipped
+# Gama.ini disables logging, and a file survives a run that dies (zero-GC references). Timestamps are milliseconds
+# since {base}, the same clock for every simulation of a run. Runs are sequential, so files are reused across runs.
+PROBE = ("\n\treflex __bench_probe { save (\"BENCH_T \" + cycle + \" \" + int(gama.machine_time - {base})) "
+		 "to: \"{path}-\" + int(seed) + \".txt\" format: \"text\" rewrite: false; }\n")
+
+
+def workload_names():
+	return [m + sfx for sfx in SCENARIOS for m in WORKLOADS]
+
+
+def scenario_of(wl):
+	for sfx, sc in SCENARIOS.items():
+		if sfx and wl.endswith(sfx):
+			return wl[:-len(sfx)], sc
+	return wl, SCENARIOS[""]
 
 # ------------------------------------------------------------------------------------------------ configs
 # heap: "base" | "half" | "double" | "nogc" (sizes resolved from RAM at run time, see heap_sizes()).
@@ -263,7 +280,7 @@ def install_semeru(work, args):
 	return info
 
 
-def prepare_models(work, gama_root, scale):
+def prepare_models(work, gama_root, scale, parallel, waves):
 	"""Extract the library models, apply the workload scaling and inject the probe."""
 	lib = work / "library"
 	if not (lib / ".extracted").exists():
@@ -281,7 +298,8 @@ def prepare_models(work, gama_root, scale):
 	shutil.rmtree(mdir, ignore_errors=True); shutil.rmtree(xdir, ignore_errors=True)
 	xdir.mkdir(parents=True)
 	(work / "probe").mkdir(exist_ok=True)
-	cycles = {}
+	base = float(int(time.time() * 1000))  # probe clock origin; GAML int is 32-bit, so stay well under 24 days
+	plans = {}
 	for name, w in WORKLOADS.items():
 		shutil.copytree(lib / "models" / w["src"], mdir / name)
 		f = mdir / name / w["model"]
@@ -290,21 +308,24 @@ def prepare_models(work, gama_root, scale):
 			if old not in code:
 				raise SystemExit(f"{name}: '{old}' not found in {w['model']} (model changed upstream?)")
 			code = code.replace(old, new)
-		probe = PROBE.replace("{path}", str(work / "probe" / f"{name}.txt"))
+		probe = PROBE.replace("{path}", str(work / "probe" / name)).replace("{base}", repr(base))
 		code, n = re.subn(r"^global[^{\n]*\{", lambda m: m.group(0) + probe, code, count=1, flags=re.M)
 		if n != 1:
 			raise SystemExit(f"{name}: no global block found for the probe")
 		f.write_text(code, encoding="utf-8")
-		cycles[name] = max(10, int(round(w["cycles"] * scale)))
-		(xdir / f"{name}.xml").write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
-<Experiment_plan>
-  <Simulation id="0" sourcePath="{f}" finalStep="{cycles[name] + 2}" experiment="{w['exp']}" seed="42">
+		for sfx, sc in SCENARIOS.items():
+			par, wav = (parallel, waves) if sc["batch"] else (1, 1)
+			cyc = max(10, int(round(w["cycles"] * scale * sc.get("cycle_factor", 1.0))))
+			seeds = list(range(1, par * wav + 1)) if sc["batch"] else [42]
+			sims = "".join(f"""  <Simulation id="{i}" sourcePath="{f}" finalStep="{cyc + 2}" experiment="{w['exp']}" seed="{sd}">
     <Parameters/>
     <Outputs/>
   </Simulation>
-</Experiment_plan>
-""", encoding="utf-8")
-	return cycles
+""" for i, sd in enumerate(seeds))
+			(xdir / f"{name}{sfx}.xml").write_text(
+				f'<?xml version="1.0" encoding="UTF-8"?>\n<Experiment_plan>\n{sims}</Experiment_plan>\n', encoding="utf-8")
+			plans[name + sfx] = dict(model=name, target=cyc, parallel=par, waves=wav, seeds=seeds, batch=sc["batch"])
+	return plans
 
 
 # ------------------------------------------------------------------------------------------------ run
@@ -319,9 +340,9 @@ def mem_total():
 	return meminfo("MemTotal")
 
 
-def heap_sizes(arg):
+def heap_sizes(arg, cap=8 * GiB):
 	ram = mem_total()
-	base = parse_size(arg) if arg != "auto" else min(8 * GiB, int(ram * 0.5))
+	base = parse_size(arg) if arg != "auto" else min(cap, int(ram * 0.5))
 	return dict(base=base, half=base // 2, double=min(2 * base, int(ram * 0.75)),
 				# zero-GC references fill their whole heap: never more than what is free right now
 				nogc=min(24 * GiB, int(ram * 0.6), int(meminfo("MemAvailable") * 0.8)))
@@ -383,19 +404,34 @@ def pct(xs, p):
 	return xs[min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1))))] if xs else 0
 
 
-def parse_run(rundir, target):
-	r = {}
-	out = (rundir / "probe.txt").read_text(errors="replace") if (rundir / "probe.txt").exists() else ""
-	t = {}
-	for c, ms in re.findall(r"BENCH_T (\d+) (\d+)", out):
-		t[int(c)] = int(ms)
-	cyc = [t[c + 1] - t[c] for c in range(min(target, max(t, default=0))) if c in t and c + 1 in t]
-	warm = max(1, target // 10)
-	steady = cyc[warm:] or cyc
-	r.update(cycles_done=len(cyc), target=target, complete=len(cyc) >= target, cyc=cyc)
-	if cyc:
-		r.update(sim_s=sum(cyc) / 1000, cyc_p50=st.median(steady), cyc_p95=pct(steady, 95), cyc_p99=pct(steady, 99),
-				 cyc_max=max(steady), cyc_mean=st.mean(steady))
+def parse_run(rundir, plan):
+	"""sim_s is the makespan: first cycle of the first simulation to last cycle of the last one."""
+	target, warm = plan["target"], max(1, plan["target"] // 10)
+	r = dict(target=target, sims=len(plan["seeds"]), parallel=plan["parallel"], waves=plan["waves"])
+	per_sim, first, last = {}, [], []
+	for sd in plan["seeds"]:
+		f = rundir / "probe" / f"{plan['model']}-{sd}.txt"
+		t = {}
+		for c, ms in re.findall(r"BENCH_T (\d+) (-?\d+)", f.read_text(errors="replace") if f.exists() else ""):
+			t[int(c)] = int(ms)
+		cyc = [t[c + 1] - t[c] for c in range(min(target, max(t, default=0))) if c in t and c + 1 in t]
+		per_sim[sd] = cyc
+		if cyc:
+			first.append(t[0]); last.append(t[len(cyc)])
+	steady = [d for cyc in per_sim.values() for d in (cyc[warm:] or cyc)]
+	done = [len(c) for c in per_sim.values()]
+	r.update(cycles_done=sum(done), sims_done=sum(1 for n in done if n >= target),
+			 complete=all(n >= target for n in done),
+			 cyc=per_sim[plan["seeds"][0]] if len(per_sim) == 1 else [])  # per-cycle list kept for single runs only
+	r["target"] = target * len(plan["seeds"])
+	if steady:
+		r.update(sim_s=(max(last) - min(first)) / 1000, cyc_p50=st.median(steady), cyc_p95=pct(steady, 95),
+				 cyc_p99=pct(steady, 99), cyc_max=max(steady), cyc_mean=st.mean(steady))
+	if plan["waves"] > 1:  # seeds are queued in order: seed i runs in wave (i-1) // parallel
+		wave = lambda k: [d for sd, cyc in per_sim.items() if (sd - 1) // plan["parallel"] == k for d in cyc[warm:]]
+		w0, wn = wave(0), wave(plan["waves"] - 1)
+		if w0 and wn:
+			r["wave_drift"] = st.mean(wn) / st.mean(w0)
 	g = (rundir / "gc.log").read_text(errors="replace") if (rundir / "gc.log").exists() else ""
 	if "<verbosegc" in g:  # OpenJ9: every stop-the-world section is an <exclusive-start/end> pair
 		sp = [float(x) for x in re.findall(r"<exclusive-end[^>]*durationms=\"([\d.]+)\"", g)]
@@ -426,7 +462,7 @@ def cpu_busy(seconds=1.0):
 	return 1 - (i1 - i0) / max(1, t1 - t0)
 
 
-def run_one(cfg, wl, rep, target, heaps, gama_root, javas, work, batch, timeout):
+def run_one(cfg, wl, rep, plan, heaps, gama_root, javas, work, batch, timeout):
 	rundir = work / "runs" / batch / wl / f"{cfg['name']}-r{rep}"
 	shutil.rmtree(rundir, ignore_errors=True); rundir.mkdir(parents=True)
 	cmd, heap_mb = config_cmd(cfg, heaps, gama_root, javas[cfg["jvm"]], rundir)
@@ -434,11 +470,11 @@ def run_one(cfg, wl, rep, target, heaps, gama_root, javas, work, batch, timeout)
 	(rundir / "ws").mkdir()
 	launcher = next((gama_root / "plugins").glob("org.eclipse.equinox.launcher_*.jar"))
 	cmd += ["-cp", str(launcher), "org.eclipse.equinox.launcher.Main", "-configuration", str(rundir / "configuration"),
-			"-application", "gama.headless.product", "-data", str(rundir / "ws"),
+			"-application", "gama.headless.product", "-data", str(rundir / "ws"), "-hpc", str(plan["parallel"]),
 			str(work / "xml" / f"{wl}.xml"), str(rundir / "out")]
 	(rundir / "cmd.txt").write_text("\n".join(cmd))
-	probe = work / "probe" / f"{wl}.txt"
-	probe.unlink(missing_ok=True)
+	for f in (work / "probe").glob(f"{plan['model']}-*.txt"):
+		f.unlink()
 	env = dict(os.environ, LC_ALL="C", LANG="C")
 	load_before = os.getloadavg()[0]
 	busy_before = cpu_busy()
@@ -462,9 +498,10 @@ def run_one(cfg, wl, rep, target, heaps, gama_root, javas, work, batch, timeout)
 			 wall_s=time.time() - t0, cpu_s=ru.ru_utime + ru.ru_stime, cpu_user=ru.ru_utime, cpu_sys=ru.ru_stime,
 			 maxrss_mb=ru.ru_maxrss / 1024, load_before=load_before, busy_before=busy_before,
 			 load_after=os.getloadavg()[0])
-	if probe.exists():
-		shutil.move(str(probe), rundir / "probe.txt")
-	r.update(parse_run(rundir, target))
+	(rundir / "probe").mkdir()
+	for f in (work / "probe").glob(f"{plan['model']}-*.txt"):
+		shutil.move(str(f), rundir / "probe" / f.name)
+	r.update(parse_run(rundir, plan))
 	for d in ("configuration", "ws", "out", "p2"):
 		shutil.rmtree(rundir / d, ignore_errors=True)
 	(rundir / "artifacts.xml").unlink(missing_ok=True)
@@ -507,13 +544,16 @@ def cmd_run(args, work):
 		names = [n for n in names if CFG[n]["jvm"] != "openj9"]
 	if any(CFG[n]["jvm"] == "openj9" for n in names):
 		javas["openj9"] = str(Path(install_semeru(work, args)["java_home"]) / "bin" / "java")
-	wls = select(list(WORKLOADS), args.workloads)
-	cycles = prepare_models(work, gama_root, args.scale)
-	heaps = heap_sizes(args.heap)
-	if heaps["double"] <= heaps["base"] * 1.2:
+	wls = select(workload_names(), args.workloads)
+	parallel = args.parallel or os.cpu_count()
+	plans = prepare_models(work, gama_root, args.scale, parallel, args.waves)
+	heaps = {False: heap_sizes(args.heap), True: heap_sizes(args.heap_batch, cap=32 * GiB)}
+	if heaps[False]["double"] <= heaps[False]["base"] * 1.2:
 		names = [n for n in names if CFG[n]["heap"] != "double"]
 		log("  not enough RAM for the 'double' heap configs, skipped")
-	names = preflight(names, heaps, gama_root, javas, work)
+	names = preflight(names, heaps[any(plans[w]["batch"] for w in wls)], gama_root, javas, work)
+	# Zero-GC references fill their heap within seconds when many simulations run at once: single scenario only.
+	cfgs_for = lambda wl: [n for n in names if not (plans[wl]["batch"] and CFG[n]["partial"])]
 	batch = args.batch or f"{socket.gethostname()}-{time.strftime('%Y%m%d-%H%M%S')}"
 	res = Path(args.results or work / "results" / f"{batch}.jsonl")
 	res.parent.mkdir(parents=True, exist_ok=True)
@@ -524,19 +564,22 @@ def cmd_run(args, work):
 			r = json.loads(l)
 			done.add((r["workload"], r["config"], r["rep"]))
 	plan = [(rep, wl, c) for rep in range(args.rep_offset, args.rep_offset + args.reps) for wl in wls
-			for c in random.Random(f"{batch}-{rep}-{wl}").sample(names, len(names)) if (wl, c, rep) not in done]
-	log(f"GAMA {gama.get('release', gama.get('source'))}; heap base={heaps['base'] // 2**20}m; "
+			for c in random.Random(f"{batch}-{rep}-{wl}").sample(cfgs_for(wl), len(cfgs_for(wl))) if (wl, c, rep) not in done]
+	est = sum(NOMINAL_RUN_S[plans[wl]["batch"]] for _, wl, _ in plan) * max(args.scale, 0.15) / 3600
+	log(f"GAMA {gama.get('release', gama.get('source'))}; heap base={heaps[False]['base'] // 2**20}m "
+		f"(batch scenario {heaps[True]['base'] // 2**20}m, {parallel} parallel x {args.waves} waves); "
 		f"{len(names)} configs x {len(wls)} workloads x {args.reps} reps -> {len(plan)} runs to do "
-		f"(~{len(plan) * NOMINAL_RUN_S * max(args.scale, 0.15) / 3600:.1f} h on a 16-core desktop); results: {res}")
+		f"(~{est:.1f} h on a 16-core desktop); results: {res}")
 	for i, (rep, wl, c) in enumerate(plan, 1):
-		r = run_one(CFG[c], wl, rep, cycles[wl], heaps, gama_root, javas, work, batch, args.timeout)
+		pl = plans[wl]
+		r = run_one(CFG[c], wl, rep, pl, heaps[pl["batch"]], gama_root, javas, work, batch, args.timeout)
 		with open(res, "a") as f:
 			f.write(json.dumps(r) + "\n")
 		state = ("partial" if CFG[c]["partial"] else "ok" if r["complete"] and not r["errors"]
 				 else f"FAILED exit={r['exit']} errors={r['errors']}")
 		if r["busy_before"] > 0.10:
 			state += f"  (other processes used {r['busy_before']:.0%} of the CPU just before this run)"
-		log(f"[{i}/{len(plan)}] {wl:9s} {c:16s} sim={r.get('sim_s', 0):7.1f}s p99={r.get('cyc_p99', 0):6.0f}ms "
+		log(f"[{i}/{len(plan)}] {wl:15s} {c:16s} sim={r.get('sim_s', 0):7.1f}s p99={r.get('cyc_p99', 0):6.0f}ms "
 			f"stw={r['stw_ms']:7.0f}ms cpu={r['cpu_s']:6.0f}s rss={r['maxrss_mb']:6.0f}MB "
 			f"cycles={r['cycles_done']}/{r['target']} {state}")
 	return res
@@ -570,7 +613,7 @@ def cmd_report(paths, out_dir, baseline):
 		b = base.get((r["batch"], r["workload"], r["rep"]))
 		for k in ("sim_s", "cyc_p99", "maxrss_mb", "cpu_s"):
 			r[f"rel_{k}"] = r[k] / b[k] if b and b.get(k) else None
-	wls = [w for w in WORKLOADS if any(r["workload"] == w for r in rows)]
+	wls = [w for w in workload_names() if any(r["workload"] == w for r in rows)]
 	cfgs = sorted({r["config"] for r in ok}, key=lambda c: [x[0] for x in CONFIGS].index(c) if c in CFG else 999)
 	grp = lambda w, c: [r for r in ok if r["workload"] == w and r["config"] == c]
 	med = lambda rs, k: st.median([r[k] for r in rs if r.get(k) is not None]) if any(
@@ -593,22 +636,33 @@ def cmd_report(paths, out_dir, baseline):
 		  "(OpenJ9); `pacing` is Shenandoah's per-thread throttling summed over threads (not a pause).",
 		  "- OpenJ9 configs also change the JIT compiler, so their gap to HotSpot is JIT + GC, not GC alone; compare "
 		  "OpenJ9 policies with each other, and HotSpot collectors with each other.", ""]
-	# Overall ranking
-	L += ["## Ranking (geometric mean over workloads, relative to baseline; lower is better)", "",
-		  "| config | family | sim time | p99 cycle | CPU | RSS | workloads | failures |", "|---|---|---|---|---|---|---|---|"]
-	rank = []
-	for c in cfgs:
-		per = {k: [med(grp(w, c), f"rel_{k}") for w in wls if grp(w, c)] for k in ("sim_s", "cyc_p99", "cpu_s", "maxrss_mb")}
-		nf = sum(1 for r in failed if r["config"] == c)
-		rank.append((gmean(per["sim_s"]), c, per, nf))
-	for g, c, per, nf in sorted(rank, key=lambda x: (math.isnan(x[0]), x[0])):
-		L.append(f"| `{c}` | {CFG.get(c, {}).get('family', '?')} | x{g:.3f} | x{gmean(per['cyc_p99']):.3f} | "
-				 f"x{gmean(per['cpu_s']):.2f} | x{gmean(per['maxrss_mb']):.2f} | {len(per['sim_s'])} | {nf or ''} |")
+	L += ["- `-batch` workloads run many simulations in one JVM: `parallel` at once and `waves` in a row per worker "
+		  "(later ones start after a model reload). Their `sim time` is the makespan of all simulations, their cycle "
+		  "percentiles cover every simulation, and `wave drift` is the mean cycle time of the last wave divided by "
+		  "the first (above 1 = later simulations ran slower).", ""]
+	# One ranking per scenario: a collector can win the interactive case and lose the batch one
+	for title, in_sc in (("single simulation per JVM (interactive, GUI-like)", lambda w: not scenario_of(w)[1]["batch"]),
+						 ("parallel batch with model reloads", lambda w: scenario_of(w)[1]["batch"])):
+		sw = [w for w in wls if in_sc(w)]
+		if not sw:
+			continue
+		L += [f"## Ranking - {title} (geometric mean over workloads, relative to baseline; lower is better)", "",
+			  "| config | family | sim time | p99 cycle | CPU | RSS | workloads | failures |", "|---|---|---|---|---|---|---|---|"]
+		rank = []
+		for c in cfgs:
+			per = {k: [med(grp(w, c), f"rel_{k}") for w in sw if grp(w, c)] for k in ("sim_s", "cyc_p99", "cpu_s", "maxrss_mb")}
+			nf = sum(1 for r in failed if r["config"] == c and r["workload"] in sw)
+			if per["sim_s"] or nf:
+				rank.append((gmean(per["sim_s"]), c, per, nf))
+		for g, c, per, nf in sorted(rank, key=lambda x: (math.isnan(x[0]), x[0])):
+			L.append(f"| `{c}` | {CFG.get(c, {}).get('family', '?')} | x{g:.3f} | x{gmean(per['cyc_p99']):.3f} | "
+					 f"x{gmean(per['cpu_s']):.2f} | x{gmean(per['maxrss_mb']):.2f} | {len(per['sim_s'])} | {nf or ''} |")
+		L.append("")
 	# Per workload
 	for w in wls:
 		L += ["", f"## {w}", "",
-			  "| config | n | sim s | vs base | spread | p50 ms | p99 ms | max ms | STW ms | STW max | pacing ms | CPU s | RSS MB |",
-			  "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+			  "| config | n | sim s | vs base | spread | p50 ms | p99 ms | max ms | STW ms | STW max | pacing ms | CPU s | RSS MB | wave drift |",
+			  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
 		for c in sorted([c for c in cfgs if grp(w, c)], key=lambda c: med(grp(w, c), "sim_s")):
 			rs = grp(w, c)
 			sims = [r["sim_s"] for r in rs]
@@ -617,7 +671,8 @@ def cmd_report(paths, out_dir, baseline):
 			L.append(f"| `{c}` | {len(rs)} | {med(rs, 'sim_s'):.1f} | {(rel - 1) * 100:+.1f}% | {spread:.1f}% | "
 					 f"{med(rs, 'cyc_p50'):.0f} | {med(rs, 'cyc_p99'):.0f} | {med(rs, 'cyc_max'):.0f} | "
 					 f"{med(rs, 'stw_ms'):.0f} | {med(rs, 'stw_max'):.1f} | {med(rs, 'pacing_ms'):.0f} | "
-					 f"{med(rs, 'cpu_s'):.0f} | {med(rs, 'maxrss_mb'):.0f} |")
+					 f"{med(rs, 'cpu_s'):.0f} | {med(rs, 'maxrss_mb'):.0f} | "
+					 f"{'' if math.isnan(med(rs, 'wave_drift')) else format(med(rs, 'wave_drift'), '.2f')} |")
 	# Zero-GC references: compare the cycles they completed with the same cycles of every other run.
 	refs = [r for r in rows if r["partial"] and r["cycles_done"] > max(1, r["target"] // 10) + 5]
 	if refs:
@@ -663,7 +718,7 @@ def cmd_report(paths, out_dir, baseline):
 	(out_dir / "report.md").write_text("\n".join(L) + "\n")
 	keys = ["batch", "host", "workload", "config", "family", "jvm", "rep", "heap_mb", "exit", "complete", "cycles_done",
 			"target", "errors", "sim_s", "rel_sim_s", "cyc_p50", "cyc_p95", "cyc_p99", "cyc_max", "stw_ms", "stw_n", "stw_max",
-			"pacing_ms", "alloc_stall_ms", "gc_cycles", "cpu_s", "maxrss_mb", "wall_s", "busy_before", "load_before", "load_after"]
+			"pacing_ms", "alloc_stall_ms", "gc_cycles", "cpu_s", "maxrss_mb", "sims", "parallel", "waves", "wave_drift", "wall_s", "busy_before", "load_before", "load_after"]
 	with open(out_dir / "summary.csv", "w") as f:
 		f.write(",".join(keys) + "\n")
 		for r in rows:
@@ -688,7 +743,10 @@ def main():
 	ap.add_argument("--reps", type=int, default=5)
 	ap.add_argument("--rep-offset", type=int, default=0, help="first rep index (to split reps over machines)")
 	ap.add_argument("--scale", type=float, default=1.0, help="multiplier on the number of simulated cycles")
-	ap.add_argument("--heap", default="auto", help="base -Xmx (default: min(8g, RAM/2))")
+	ap.add_argument("--heap", default="auto", help="base -Xmx, single scenario (default: min(8g, RAM/2))")
+	ap.add_argument("--heap-batch", default="auto", help="base -Xmx, -batch scenario (default: min(32g, RAM/2))")
+	ap.add_argument("--parallel", type=int, default=0, help="-batch: simulations at once (default: logical cores)")
+	ap.add_argument("--waves", type=int, default=3, help="-batch: simulations in a row per worker (model reloads)")
 	ap.add_argument("--batch", help="batch id (default: host-date); reusing one resumes it")
 	ap.add_argument("--results", help="results .jsonl (default: <work>/results/<batch>.jsonl)")
 	ap.add_argument("--timeout", type=int, default=2400, help="seconds before a run is killed")
@@ -706,7 +764,8 @@ def main():
 		print("configs:")
 		for c in CONFIGS:
 			print(f"  {c[0]:18s} {c[1]:8s} heap={c[4]:6s}({h[c[4]] // 2**20}m) {c[3]}{'  [zero-GC reference]' if c[5] else ''}")
-		print("workloads:")
+		print("workloads (each also as <name>-batch: --parallel simulations at once x --waves in a row, "
+			  f"{SCENARIOS['-batch']['cycle_factor']:.0%} of the cycles each):")
 		for n, w in WORKLOADS.items():
 			print(f"  {n:10s} {w['src']}/{w['model']} [{w['exp']}] {w['cycles']} cycles")
 	elif args.command == "install":
