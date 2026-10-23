@@ -1,0 +1,131 @@
+# GAMA garbage-collector benchmark on GitHub-hosted runners.
+# Copy the content of benchmarks/gc/ (gc_bench.py + this .github folder) to the root of a repository.
+#
+# Runner VMs differ from job to job, so a job never compares against another job: each job runs EVERY
+# config, interleaved, for one workload x one repetition, and the report divides each run by the
+# baseline run of the same job before aggregating.
+name: GAMA GC benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      gama_release:
+        description: "GAMA release tag ('latest' = newest release with a Linux_with_JDK zip)"
+        default: latest
+      gama_zip_url:
+        description: "Optional URL of a GAMA Linux_with_JDK zip (overrides the release)"
+        default: ""
+      reps:
+        description: "Repetitions per workload (one job each)"
+        default: "5"
+      configs:
+        description: "Configs: 'all' or comma-separated names/globs (see `python3 gc_bench.py list`)"
+        default: all
+      workloads:
+        description: "Workloads: 'all' or comma-separated names"
+        default: all
+      scale:
+        description: "Multiplier on simulated cycles (0.1 = smoke test)"
+        default: "1.0"
+      openj9:
+        description: "Include the OpenJ9 (IBM Semeru) track"
+        type: boolean
+        default: true
+      runner:
+        description: "Runner label (ubuntu-latest is 4 vCPU / 16 GB on public repos)"
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          WORKLOADS: ${{ inputs.workloads }}
+          REPS: ${{ inputs.reps }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+          sys.path.insert(0, ".")
+          import gc_bench as g
+          wls = g.select(list(g.WORKLOADS), os.environ["WORKLOADS"])
+          inc = [{"workload": w, "rep": r} for r in range(int(os.environ["REPS"])) for w in wls]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": inc}) + "\n")
+          print(len(inc), "jobs")
+          EOF
+
+  bench:
+    needs: plan
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: bench ${{ matrix.workload }} r${{ matrix.rep }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run every config on ${{ matrix.workload }}
+        # Leaves time for the upload steps if the job is long: results are appended after every run.
+        timeout-minutes: 335
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GAMA_RELEASE: ${{ inputs.gama_release }}
+          GAMA_ZIP_URL: ${{ inputs.gama_zip_url }}
+          CONFIGS: ${{ inputs.configs }}
+          SCALE: ${{ inputs.scale }}
+          OPENJ9: ${{ inputs.openj9 }}
+          WORKLOAD: ${{ matrix.workload }}
+          REP: ${{ matrix.rep }}
+        run: |
+          args=(--work work --workloads "$WORKLOAD" --reps 1 --rep-offset "$REP"
+                --batch "gha-${GITHUB_RUN_ID}-${WORKLOAD}-r${REP}" --configs "$CONFIGS" --scale "$SCALE" --timeout 3000)
+          if [ -n "$GAMA_ZIP_URL" ]; then args+=(--gama-zip "$GAMA_ZIP_URL"); else args+=(--gama-release "$GAMA_RELEASE"); fi
+          [ "$OPENJ9" = "true" ] || args+=(--no-openj9)
+          nproc; free -g; cat /sys/kernel/mm/transparent_hugepage/enabled
+          python3 gc_bench.py run "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.workload }}-r${{ matrix.rep }}
+          path: work/results/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.workload }}-r${{ matrix.rep }}
+          path: |
+            work/runs/**/*.gz
+            work/runs/**/cmd.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: all-results
+          merge-multiple: true
+      - name: Build report
+        run: |
+          python3 gc_bench.py report all-results --work report
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: |
+            report/report.md
+            report/summary.csv
+            all-results/
